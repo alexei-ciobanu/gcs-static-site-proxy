@@ -1,0 +1,42 @@
+name: Publish release to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.4"
+          python-version: "3.14"
+
+      - name: Build distributions
+        run: uv build --no-sources
+
+      - name: Smoke-test wheel
+        run: >-
+          uv run --isolated --no-project --with ./dist/*.whl
+          gcs-static-site-proxy --version
+
+      - name: Smoke-test source distribution
+        run: >-
+          uv run --isolated --no-project --with ./dist/*.tar.gz
+          gcs-static-site-proxy --version
+
+      - name: Publish to PyPI
+        run: uv publish

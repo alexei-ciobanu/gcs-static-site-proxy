@@ -22,12 +22,17 @@ from gcs_static_site_proxy.auth import (
 )
 from gcs_static_site_proxy.catalog import CATALOG_CONFIG_NAME
 from gcs_static_site_proxy.gcs import GcsClient, GcsConnectionError
-from gcs_static_site_proxy.site_config import SITE_CONFIG_NAME, ContentSecurityPolicy
+from gcs_static_site_proxy.site_config import (
+    SITE_CONFIG_NAME,
+    BrowserCacheMode,
+    BrowserCachePolicy,
+    ContentSecurityPolicy,
+    default_browser_cache,
+)
 
 LOCAL_PREFIX = "/__gcs_proxy"
 SESSION_COOKIE = "gcs_static_site_proxy_session"
 FORWARDED_HEADERS = {
-    "cache-control",
     "content-encoding",
     "content-language",
     "content-length",
@@ -151,6 +156,7 @@ class SiteMount:
     title: str
     prefix: str
     csp: ContentSecurityPolicy
+    browser_cache: BrowserCachePolicy = field(default_factory=default_browser_cache)
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ class ProxyConfig:
     bucket: str
     prefix: str
     csp: ContentSecurityPolicy
+    browser_cache: BrowserCachePolicy = field(default_factory=default_browser_cache)
     bind: str = "127.0.0.1"
     port: int = 8080
     allow_hosts: tuple[str, ...] = ()
@@ -173,6 +180,7 @@ class ResolvedRoute:
     prefix: str
     path: str
     csp: ContentSecurityPolicy
+    browser_cache: BrowserCachePolicy
     add_trailing_slash: bool = False
 
 
@@ -335,7 +343,12 @@ def object_candidates(prefix: str, path: str) -> list[str]:
 
 def resolve_route(config: ProxyConfig, path: str) -> ResolvedRoute | None:
     if not path.startswith("/sites/"):
-        return ResolvedRoute(prefix=config.prefix, path=path, csp=config.csp)
+        return ResolvedRoute(
+            prefix=config.prefix,
+            path=path,
+            csp=config.csp,
+            browser_cache=config.browser_cache,
+        )
     relative = path.removeprefix("/sites/")
     slug, separator, remainder = relative.partition("/")
     mount = next(
@@ -348,13 +361,37 @@ def resolve_route(config: ProxyConfig, path: str) -> ResolvedRoute | None:
             prefix=mount.prefix,
             path="/",
             csp=mount.csp,
+            browser_cache=mount.browser_cache,
             add_trailing_slash=True,
         )
     return ResolvedRoute(
         prefix=mount.prefix,
         path=f"/{remainder}",
         csp=mount.csp,
+        browser_cache=mount.browser_cache,
     )
+
+
+def conditional_headers(request: web.Request) -> dict[str, str]:
+    """Return only standard cache validators safe to forward to GCS."""
+
+    return {
+        name: value
+        for name in ("If-None-Match", "If-Modified-Since")
+        if (value := request.headers.get(name)) is not None
+    }
+
+
+def is_html_object(object_name: str, content_type: str | None = None) -> bool:
+    lowered = object_name.lower()
+    return lowered.endswith((".html", ".htm")) or bool(
+        content_type and content_type.lower().partition(";")[0].strip() == "text/html"
+    )
+
+
+def is_revalidation_candidate(object_name: str) -> bool:
+    basename = object_name.rsplit("/", 1)[-1]
+    return "." in basename and not is_html_object(object_name)
 
 
 class GcsStaticSiteProxy:
@@ -483,7 +520,22 @@ class GcsStaticSiteProxy:
 
         try:
             for object_name in candidates:
-                upstream = await self.gcs.request(object_name)
+                revalidate = (
+                    route.browser_cache.mode is BrowserCacheMode.REVALIDATE
+                    and is_revalidation_candidate(object_name)
+                )
+                upstream = await self.gcs.request(
+                    object_name,
+                    conditional_headers=(
+                        conditional_headers(request) if revalidate else None
+                    ),
+                )
+                if upstream.status == 304 and (
+                    not upstream.headers.get("Content-Type")
+                    or is_html_object(object_name, upstream.headers.get("Content-Type"))
+                ):
+                    upstream.release()
+                    upstream = await self.gcs.request(object_name)
                 if upstream.status == 404:
                     upstream.release()
                     continue
@@ -494,6 +546,8 @@ class GcsStaticSiteProxy:
                     return self._text_response(
                         403, "GCS denied access\n", csp=route.csp.value
                     )
+                if upstream.status == 304 and revalidate:
+                    return self._not_modified(upstream, csp=route.csp.value)
                 if upstream.status != 200:
                     status = upstream.status
                     upstream.release()
@@ -509,7 +563,13 @@ class GcsStaticSiteProxy:
                     return self._redirect_response(
                         f"{request.path}/", csp=route.csp.value
                     )
-                return await self._stream_object(request, upstream, csp=route.csp.value)
+                return await self._stream_object(
+                    request,
+                    upstream,
+                    object_name=object_name,
+                    browser_cache=route.browser_cache,
+                    csp=route.csp.value,
+                )
             return self._text_response(404, "Not found\n", csp=route.csp.value)
         except AuthenticationUnavailable:
             return self.authentication_page(request)
@@ -524,13 +584,22 @@ class GcsStaticSiteProxy:
         request: web.Request,
         upstream: ClientResponse,
         *,
+        object_name: str,
+        browser_cache: BrowserCachePolicy,
         csp: str | None,
     ) -> web.StreamResponse:
         downstream = web.StreamResponse(status=200)
         for name, value in upstream.headers.items():
             if name.lower() in FORWARDED_HEADERS:
                 downstream.headers[name] = value
-        downstream.headers.setdefault("Cache-Control", "private,no-store")
+        cacheable = (
+            browser_cache.mode is BrowserCacheMode.REVALIDATE
+            and is_revalidation_candidate(object_name)
+            and not is_html_object(object_name, upstream.headers.get("Content-Type"))
+        )
+        downstream.headers["Cache-Control"] = (
+            "private,no-cache" if cacheable else "private,no-store"
+        )
         self._security_headers(downstream.headers, csp=csp)
         try:
             await downstream.prepare(request)
@@ -543,6 +612,20 @@ class GcsStaticSiteProxy:
             return downstream
         finally:
             upstream.release()
+
+    def _not_modified(
+        self, upstream: ClientResponse, *, csp: str | None
+    ) -> web.Response:
+        headers = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.lower() in {"etag", "last-modified"}
+        }
+        headers["Cache-Control"] = "private,no-cache"
+        response = web.Response(status=304, headers=headers)
+        self._security_headers(response.headers, csp=csp)
+        upstream.release()
+        return response
 
     def network_authentication_page(self) -> web.Response:
         return self._html_response(
@@ -658,7 +741,7 @@ call('{LOCAL_PREFIX}/auth/status');setInterval(()=>call('{LOCAL_PREFIX}/auth/sta
     ) -> web.Response:
         response = web.Response(
             status=308,
-            headers={"Location": location, "Cache-Control": "private,no-cache"},
+            headers={"Location": location, "Cache-Control": "no-store"},
         )
         self._security_headers(response.headers, csp=csp)
         return response

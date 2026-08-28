@@ -12,7 +12,12 @@ from aiohttp.test_utils import TestServer
 
 from gcs_static_site_proxy.gcs import GcsClient
 from gcs_static_site_proxy.server import GcsStaticSiteProxy, ProxyConfig, SiteMount
-from gcs_static_site_proxy.site_config import ContentSecurityPolicy, default_csp
+from gcs_static_site_proxy.site_config import (
+    BrowserCacheMode,
+    BrowserCachePolicy,
+    ContentSecurityPolicy,
+    default_csp,
+)
 
 
 class FakeTokens:
@@ -39,13 +44,32 @@ async def mock_gcs(
         if name not in objects:
             return web.Response(status=404)
         body, headers = objects[name]
+        if headers.get("X-Test-Status") == "401":
+            return web.Response(status=401)
+        etag = headers.get("ETag", '"test-etag"')
+        last_modified = headers.get("Last-Modified", "Tue, 25 Aug 2026 00:00:00 GMT")
+        response_headers = {
+            "Content-Disposition": "attachment",
+            "x-goog-generation": "42",
+            "ETag": etag,
+            "Last-Modified": last_modified,
+            **{
+                name: value
+                for name, value in headers.items()
+                if not name.startswith("X-Test-")
+            },
+        }
+        if request.headers.get("If-None-Match") == etag or (
+            "If-None-Match" not in request.headers
+            and request.headers.get("If-Modified-Since") == last_modified
+        ):
+            not_modified_headers = response_headers.copy()
+            if headers.get("X-Test-Omit-304-Content-Type") == "true":
+                not_modified_headers.pop("Content-Type", None)
+            return web.Response(status=304, headers=not_modified_headers)
         return web.Response(
             body=body,
-            headers={
-                "Content-Disposition": "attachment",
-                "x-goog-generation": "42",
-                **headers,
-            },
+            headers=response_headers,
         )
 
     app = web.Application()
@@ -60,13 +84,17 @@ async def mock_gcs(
 
 @asynccontextmanager
 async def running_proxy(
-    objects: dict[str, tuple[bytes, dict[str, str]]], *, network_mode: bool = False
+    objects: dict[str, tuple[bytes, dict[str, str]]],
+    *,
+    network_mode: bool = False,
+    browser_cache: BrowserCacheMode = BrowserCacheMode.NO_STORE,
 ) -> AsyncIterator[tuple[ClientSession, str, GcsStaticSiteProxy]]:
     async with mock_gcs(objects) as api_root:
         config = ProxyConfig(
             bucket="example-bucket",
             prefix="team/site",
             csp=default_csp(),
+            browser_cache=BrowserCachePolicy(browser_cache, source="test"),
             bind="0.0.0.0" if network_mode else "127.0.0.1",
             gcs_api_root=api_root,
         )
@@ -99,6 +127,13 @@ def site_objects() -> dict[str, tuple[bytes, dict[str, str]]]:
             b"<h1>About</h1>",
             {"Content-Type": "text/html; charset=utf-8"},
         ),
+        "team/site/mislabelled.txt": (
+            b"<h1>Still HTML</h1>",
+            {
+                "Content-Type": "text/html; charset=utf-8",
+                "X-Test-Omit-304-Content-Type": "true",
+            },
+        ),
         "team/site/docs/index.html": (
             b'<script src="assets/docs.js"></script>',
             {"Content-Type": "text/html; charset=utf-8"},
@@ -126,6 +161,7 @@ async def test_proxy_serves_exact_prefix_with_security_and_gzip() -> None:
         assert response.headers["Referrer-Policy"] == "no-referrer"
         assert response.headers["X-Frame-Options"] == "DENY"
         assert response.headers["Content-Security-Policy"] == default_csp().value
+        assert response.headers["Cache-Control"] == "private,no-store"
 
         extensionless = await session.get(f"{base}about")
         assert extensionless.status == 200
@@ -134,6 +170,7 @@ async def test_proxy_serves_exact_prefix_with_security_and_gzip() -> None:
         directory = await session.get(f"{base}docs", allow_redirects=False)
         assert directory.status == 308
         assert directory.headers["Location"] == "/docs/"
+        assert directory.headers["Cache-Control"] == "no-store"
         directory_index = await session.get(f"{base}docs/")
         assert directory_index.status == 200
         assert "assets/docs.js" in await directory_index.text()
@@ -144,10 +181,85 @@ async def test_proxy_serves_exact_prefix_with_security_and_gzip() -> None:
         raw = await bundle.read()
         assert raw.startswith(b"\x1f\x8b")
         assert gzip.decompress(raw) == b'{"rows":10000}'
+        assert bundle.headers["Cache-Control"] == "private,no-store"
 
         head = await session.head(base)
         assert head.status == 200
         assert await head.read() == b""
+
+
+@pytest.mark.asyncio
+async def test_opt_in_assets_revalidate_while_html_remains_no_store() -> None:
+    async with running_proxy(
+        site_objects(), browser_cache=BrowserCacheMode.REVALIDATE
+    ) as (session, base, _proxy):
+        html = await session.get(base)
+        assert html.status == 200
+        assert html.headers["Cache-Control"] == "private,no-store"
+
+        first = await session.get(f"{base}data/review.json.gz")
+        assert first.status == 200
+        assert first.headers["Cache-Control"] == "private,no-cache"
+        etag = first.headers["ETag"]
+        await first.read()
+
+        unchanged = await session.get(
+            f"{base}data/review.json.gz",
+            headers={"If-None-Match": etag},
+        )
+        assert unchanged.status == 304
+        assert unchanged.headers["Cache-Control"] == "private,no-cache"
+        assert unchanged.headers["ETag"] == etag
+        assert await unchanged.read() == b""
+
+        unchanged_since = await session.get(
+            f"{base}data/review.json.gz",
+            headers={"If-Modified-Since": first.headers["Last-Modified"]},
+        )
+        assert unchanged_since.status == 304
+        assert await unchanged_since.read() == b""
+
+        forced_html_validator = await session.get(
+            base,
+            headers={"If-None-Match": html.headers["ETag"]},
+        )
+        assert forced_html_validator.status == 200
+        assert forced_html_validator.headers["Cache-Control"] == "private,no-store"
+
+        extensionless_html = await session.get(
+            f"{base}about",
+            headers={"If-None-Match": '"test-etag"'},
+        )
+        assert extensionless_html.status == 200
+        assert extensionless_html.headers["Cache-Control"] == "private,no-store"
+
+        content_typed_html = await session.get(
+            f"{base}mislabelled.txt",
+            headers={"If-None-Match": '"test-etag"'},
+        )
+        assert content_typed_html.status == 200
+        assert content_typed_html.headers["Cache-Control"] == "private,no-store"
+
+
+@pytest.mark.asyncio
+async def test_revalidation_does_not_hide_an_authentication_failure() -> None:
+    objects = site_objects()
+    objects["team/site/assets/private.js"] = (
+        b"console.log('private')",
+        {"Content-Type": "text/javascript", "X-Test-Status": "401"},
+    )
+    async with running_proxy(objects, browser_cache=BrowserCacheMode.REVALIDATE) as (
+        session,
+        base,
+        _proxy,
+    ):
+        response = await session.get(
+            f"{base}assets/private.js",
+            headers={"If-None-Match": '"previous"'},
+        )
+        assert response.status == 503
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "Google Cloud sign-in required" in await response.text()
 
 
 @pytest.mark.asyncio
@@ -217,6 +329,10 @@ async def test_catalog_mounts_exact_prefixes_with_per_site_csp() -> None:
             b"<h1>Mounted demo</h1>",
             {"Content-Type": "text/html; charset=utf-8"},
         ),
+        "projects/demo/publication/site/assets/app.js": (
+            b"console.log('mounted')",
+            {"Content-Type": "text/javascript"},
+        ),
         "projects/demo/protected/secret.txt": (
             b"must not be reachable",
             {"Content-Type": "text/plain"},
@@ -238,6 +354,10 @@ async def test_catalog_mounts_exact_prefixes_with_per_site_csp() -> None:
                         value=mounted_policy,
                         source="test mounted policy",
                     ),
+                    browser_cache=BrowserCachePolicy(
+                        BrowserCacheMode.REVALIDATE,
+                        source="test mounted policy",
+                    ),
                 ),
             ),
         )
@@ -256,11 +376,19 @@ async def test_catalog_mounts_exact_prefixes_with_per_site_csp() -> None:
             assert redirect.status == 308
             assert redirect.headers["Location"] == "/sites/demo/"
             assert redirect.headers["Content-Security-Policy"] == mounted_policy
+            assert redirect.headers["Cache-Control"] == "no-store"
 
             mounted = await session.get(f"{base}sites/demo/")
             assert mounted.status == 200
             assert await mounted.text() == "<h1>Mounted demo</h1>"
             assert mounted.headers["Content-Security-Policy"] == mounted_policy
+            assert mounted.headers["Cache-Control"] == "private,no-store"
+
+            mounted_asset = await session.get(f"{base}sites/demo/assets/app.js")
+            assert mounted_asset.status == 200
+            assert mounted_asset.headers["Cache-Control"] == "private,no-cache"
+
+            assert landing.headers["Cache-Control"] == "private,no-store"
 
             unknown = await session.get(f"{base}sites/unknown/")
             assert unknown.status == 404

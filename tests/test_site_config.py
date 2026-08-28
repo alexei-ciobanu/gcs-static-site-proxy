@@ -7,6 +7,7 @@ import pytest
 from gcs_static_site_proxy.site_config import (
     MAX_SITE_CONFIG_BYTES,
     STRICT_STATIC_CSP,
+    BrowserCacheMode,
     SiteConfigError,
     default_csp,
     parse_site_config,
@@ -30,11 +31,24 @@ def test_default_policy_is_strict_and_self_contained() -> None:
 
 def test_parse_site_config_records_provenance() -> None:
     body = encoded_config("default-src 'self'; script-src 'self' 'unsafe-eval'")
-    policy = parse_site_config(body, source="gs://bucket/site/config", generation="7")
-    assert policy.value == "default-src 'self'; script-src 'self' 'unsafe-eval'"
-    assert policy.source == "gs://bucket/site/config"
-    assert policy.generation == "7"
-    assert len(policy.sha256 or "") == 64
+    configured = parse_site_config(
+        body, source="gs://bucket/site/config", generation="7"
+    )
+    assert configured.csp.value == (
+        "default-src 'self'; script-src 'self' 'unsafe-eval'"
+    )
+    assert configured.csp.source == "gs://bucket/site/config"
+    assert configured.csp.generation == "7"
+    assert len(configured.csp.sha256 or "") == 64
+    assert configured.browser_cache.mode is BrowserCacheMode.NO_STORE
+
+
+def test_parse_site_config_enables_opt_in_revalidation() -> None:
+    configured = parse_site_config(
+        encoded_config("default-src 'self'", browserCache="revalidate"),
+        source="test",
+    )
+    assert configured.browser_cache.mode is BrowserCacheMode.REVALIDATE
 
 
 @pytest.mark.parametrize(
@@ -45,6 +59,14 @@ def test_parse_site_config_records_provenance() -> None:
         (json.dumps({"version": 1}).encode(), "missing"),
         (encoded_config("default-src 'self'", unexpected=True), "unknown"),
         (encoded_config("default-src 'self'", version=2), "version must be 1"),
+        (
+            encoded_config("default-src 'self'", browserCache="forever"),
+            "browserCache must be one of",
+        ),
+        (
+            encoded_config("default-src 'self'", browserCache=[]),
+            "browserCache must be one of",
+        ),
         (encoded_config(""), "non-empty string"),
         (encoded_config(None), "non-empty string"),
         (encoded_config("default-src 'self'\nX-Test: yes"), "printable ASCII"),

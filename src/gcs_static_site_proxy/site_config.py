@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,25 @@ class ContentSecurityPolicy:
     generation: str | None = None
 
 
+class BrowserCacheMode(StrEnum):
+    """Browser caching policy for non-HTML site objects."""
+
+    NO_STORE = "no-store"
+    REVALIDATE = "revalidate"
+
+
+@dataclass(frozen=True)
+class BrowserCachePolicy:
+    mode: BrowserCacheMode
+    source: str
+
+
+@dataclass(frozen=True)
+class SiteConfiguration:
+    csp: ContentSecurityPolicy
+    browser_cache: BrowserCachePolicy
+
+
 def validate_csp(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise SiteConfigError("contentSecurityPolicy must be a non-empty string")
@@ -52,7 +72,7 @@ def validate_csp(value: Any) -> str:
 
 def parse_site_config(
     body: bytes, *, source: str, generation: str | None = None
-) -> ContentSecurityPolicy:
+) -> SiteConfiguration:
     if len(body) > MAX_SITE_CONFIG_BYTES:
         raise SiteConfigError(
             f"site configuration exceeds {MAX_SITE_CONFIG_BYTES} bytes"
@@ -64,9 +84,10 @@ def parse_site_config(
         raise SiteConfigError("site configuration must be valid UTF-8 JSON") from error
     if not isinstance(payload, dict):
         raise SiteConfigError("site configuration must be a JSON object")
-    expected = {"version", "contentSecurityPolicy"}
+    required = {"version", "contentSecurityPolicy"}
+    expected = required | {"browserCache"}
     unknown = set(payload) - expected
-    missing = expected - set(payload)
+    missing = required - set(payload)
     if unknown:
         raise SiteConfigError(f"unknown site configuration fields: {sorted(unknown)}")
     if missing:
@@ -74,11 +95,21 @@ def parse_site_config(
     if payload["version"] != 1:
         raise SiteConfigError("site configuration version must be 1")
     policy = validate_csp(payload["contentSecurityPolicy"])
-    return ContentSecurityPolicy(
-        value=policy,
-        source=source,
-        sha256=hashlib.sha256(body).hexdigest(),
-        generation=generation,
+    try:
+        browser_cache = BrowserCacheMode(
+            payload.get("browserCache", BrowserCacheMode.NO_STORE)
+        )
+    except (TypeError, ValueError) as error:
+        supported = ", ".join(mode.value for mode in BrowserCacheMode)
+        raise SiteConfigError(f"browserCache must be one of: {supported}") from error
+    return SiteConfiguration(
+        csp=ContentSecurityPolicy(
+            value=policy,
+            source=source,
+            sha256=hashlib.sha256(body).hexdigest(),
+            generation=generation,
+        ),
+        browser_cache=BrowserCachePolicy(mode=browser_cache, source=source),
     )
 
 
@@ -102,3 +133,10 @@ def load_csp_file(path: Path) -> ContentSecurityPolicy:
 
 def default_csp() -> ContentSecurityPolicy:
     return ContentSecurityPolicy(value=STRICT_STATIC_CSP, source="built-in default")
+
+
+def default_browser_cache() -> BrowserCachePolicy:
+    return BrowserCachePolicy(
+        mode=BrowserCacheMode.NO_STORE,
+        source="built-in default",
+    )

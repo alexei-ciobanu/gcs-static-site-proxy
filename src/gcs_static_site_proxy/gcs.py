@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ssl
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,7 +68,12 @@ class GcsClient:
         name = urllib.parse.quote(object_name, safe="")
         return f"{self.api_root}/b/{bucket}/o/{name}?alt=media"
 
-    async def request(self, object_name: str) -> ClientResponse:
+    async def request(
+        self,
+        object_name: str,
+        *,
+        conditional_headers: Mapping[str, str] | None = None,
+    ) -> ClientResponse:
         if self.session is None:
             raise RuntimeError("GCS client session has not started")
         try:
@@ -77,12 +83,15 @@ class GcsClient:
 
         for attempt in range(2):
             try:
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept-Encoding": "gzip",
+                }
+                if conditional_headers:
+                    headers.update(conditional_headers)
                 response = await self.session.get(
                     self.media_url(object_name),
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept-Encoding": "gzip",
-                    },
+                    headers=headers,
                     allow_redirects=False,
                 )
             except (ClientError, TimeoutError) as error:

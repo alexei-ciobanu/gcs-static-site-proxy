@@ -41,8 +41,12 @@ from gcs_static_site_proxy.server import (
 from gcs_static_site_proxy.site_config import (
     MAX_SITE_CONFIG_BYTES,
     SITE_CONFIG_NAME,
+    BrowserCacheMode,
+    BrowserCachePolicy,
     ContentSecurityPolicy,
     SiteConfigError,
+    SiteConfiguration,
+    default_browser_cache,
     default_csp,
     load_csp_file,
     parse_site_config,
@@ -59,6 +63,7 @@ HOSTNAME_PATTERN = re.compile(
 class ResolvedSource:
     prefix: str
     csp: ContentSecurityPolicy
+    browser_cache: BrowserCachePolicy
     mounts: tuple[SiteMount, ...] = ()
     catalog: SiteCatalog | None = None
 
@@ -170,6 +175,14 @@ def parser() -> argparse.ArgumentParser:
         help="do not add a CSP response header to any served route",
     )
     result.add_argument(
+        "--browser-cache",
+        choices=[mode.value for mode in BrowserCacheMode],
+        help=(
+            "override the browser cache policy for every served route; "
+            "the secure default is no-store"
+        ),
+    )
+    result.add_argument(
         "--auth-retry-seconds",
         type=positive_int,
         default=5,
@@ -189,17 +202,17 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-async def gcs_site_csp(
+async def gcs_site_configuration(
     *, bucket: str, prefix: str, auth_retry_seconds: int
-) -> ContentSecurityPolicy | None:
+) -> SiteConfiguration | None:
     tokens = AccessTokenManager(retry_seconds=auth_retry_seconds)
     async with GcsClient(bucket, tokens) as gcs:
-        return await read_site_csp(gcs, bucket=bucket, prefix=prefix)
+        return await read_site_configuration(gcs, bucket=bucket, prefix=prefix)
 
 
-async def read_site_csp(
+async def read_site_configuration(
     gcs: GcsClient, *, bucket: str, prefix: str
-) -> ContentSecurityPolicy | None:
+) -> SiteConfiguration | None:
     object_name = f"{prefix}/{SITE_CONFIG_NAME}"
     result = await gcs.read_config_object(
         object_name, maximum_bytes=MAX_SITE_CONFIG_BYTES
@@ -227,20 +240,15 @@ def explicit_csp(arguments: argparse.Namespace) -> ContentSecurityPolicy | None:
     return None
 
 
-def resolve_csp(arguments: argparse.Namespace) -> ContentSecurityPolicy:
-    override = explicit_csp(arguments)
-    if override is not None:
-        return override
-    configured = asyncio.run(
-        gcs_site_csp(
-            bucket=arguments.bucket,
-            prefix=arguments.prefix,
-            auth_retry_seconds=arguments.auth_retry_seconds,
-        )
+def explicit_browser_cache(
+    arguments: argparse.Namespace,
+) -> BrowserCachePolicy | None:
+    if arguments.browser_cache is None:
+        return None
+    return BrowserCachePolicy(
+        mode=BrowserCacheMode(arguments.browser_cache),
+        source=f"--browser-cache {arguments.browser_cache}",
     )
-    if configured is not None:
-        return configured
-    return default_csp()
 
 
 async def gcs_catalog_source(arguments: argparse.Namespace) -> ResolvedSource:
@@ -262,24 +270,35 @@ async def gcs_catalog_source(arguments: argparse.Namespace) -> ResolvedSource:
             generation=result.generation,
         )
         override = explicit_csp(arguments)
+        cache_override = explicit_browser_cache(arguments)
 
-        async def policy(prefix: str) -> ContentSecurityPolicy:
-            if override is not None:
-                return override
-            configured = await read_site_csp(
-                gcs, bucket=arguments.bucket, prefix=prefix
+        async def site_configuration(
+            prefix: str,
+        ) -> tuple[ContentSecurityPolicy, BrowserCachePolicy]:
+            configured = (
+                None
+                if override is not None and cache_override is not None
+                else await read_site_configuration(
+                    gcs, bucket=arguments.bucket, prefix=prefix
+                )
             )
-            return configured if configured is not None else default_csp()
+            csp = override or (configured.csp if configured else default_csp())
+            browser_cache = cache_override or (
+                configured.browser_cache if configured else default_browser_cache()
+            )
+            return csp, browser_cache
 
-        landing_csp = await policy(catalog_prefix)
+        landing_csp, landing_browser_cache = await site_configuration(catalog_prefix)
         mounts_list: list[SiteMount] = []
         for site in catalog.sites:
+            mounted_csp, mounted_browser_cache = await site_configuration(site.prefix)
             mounts_list.append(
                 SiteMount(
                     slug=site.slug,
                     title=site.title,
                     prefix=site.prefix,
-                    csp=await policy(site.prefix),
+                    csp=mounted_csp,
+                    browser_cache=mounted_browser_cache,
                 )
             )
         mounts = tuple(mounts_list)
@@ -287,6 +306,7 @@ async def gcs_catalog_source(arguments: argparse.Namespace) -> ResolvedSource:
     return ResolvedSource(
         prefix=catalog_prefix,
         csp=landing_csp,
+        browser_cache=landing_browser_cache,
         mounts=mounts,
         catalog=catalog,
     )
@@ -296,7 +316,27 @@ def resolve_source(arguments: argparse.Namespace) -> ResolvedSource:
     if arguments.catalog_prefix:
         return asyncio.run(gcs_catalog_source(arguments))
     assert isinstance(arguments.prefix, str)
-    return ResolvedSource(prefix=arguments.prefix, csp=resolve_csp(arguments))
+    override = explicit_csp(arguments)
+    cache_override = explicit_browser_cache(arguments)
+    configured = (
+        None
+        if override is not None and cache_override is not None
+        else asyncio.run(
+            gcs_site_configuration(
+                bucket=arguments.bucket,
+                prefix=arguments.prefix,
+                auth_retry_seconds=arguments.auth_retry_seconds,
+            )
+        )
+    )
+    return ResolvedSource(
+        prefix=arguments.prefix,
+        csp=override or (configured.csp if configured else default_csp()),
+        browser_cache=(
+            cache_override
+            or (configured.browser_cache if configured else default_browser_cache())
+        ),
+    )
 
 
 def tls_context(arguments: argparse.Namespace) -> ssl.SSLContext | None:
@@ -363,6 +403,7 @@ def run(arguments: argparse.Namespace) -> None:
         bucket=arguments.bucket,
         prefix=source.prefix,
         csp=source.csp,
+        browser_cache=source.browser_cache,
         bind=arguments.bind,
         port=arguments.port,
         allow_hosts=tuple(arguments.allow_host),
@@ -408,12 +449,14 @@ def run(arguments: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
     print_policy("Landing" if source.catalog else "Site", source.csp)
+    print_browser_cache("Landing" if source.catalog else "Site", source.browser_cache)
     for mount in source.mounts:
         print(
             f"Mount /sites/{mount.slug}/ -> "
             f"gs://{config.bucket}/{mount.prefix}/ ({mount.title})"
         )
         print_policy(f"Mount /sites/{mount.slug}/", mount.csp)
+        print_browser_cache(f"Mount /sites/{mount.slug}/", mount.browser_cache)
     print(f"Local URL: {local_url}")
     if proxy.guard.network_mode:
         print(
@@ -444,6 +487,10 @@ def print_policy(label: str, csp: ContentSecurityPolicy) -> None:
         print(f"WARNING: {label} CSP is disabled.", file=sys.stderr)
     elif "'unsafe-eval'" in csp.value:
         print(f"WARNING: {label} CSP permits 'unsafe-eval'.", file=sys.stderr)
+
+
+def print_browser_cache(label: str, policy: BrowserCachePolicy) -> None:
+    print(f"{label} browser cache: {policy.mode.value} ({policy.source})")
 
 
 LOCAL_UNLOCK_PATH = "/__gcs_proxy/unlock"

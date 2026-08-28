@@ -27,7 +27,7 @@ gcloud auth login --update-adc
 Run the published package in an isolated environment:
 
 ```bash
-uvx gcs-static-site-proxy@0.1.0 \
+uvx gcs-static-site-proxy@0.2.0 \
   --bucket private-site-bucket \
   --prefix team/sites/my-site
 ```
@@ -36,7 +36,7 @@ Alternatively, install it with `pip` and use either the command or Python
 module entry point:
 
 ```bash
-python -m pip install gcs-static-site-proxy==0.1.0
+python -m pip install gcs-static-site-proxy==0.2.0
 python -m gcs_static_site_proxy \
   --bucket private-site-bucket \
   --prefix team/sites/my-site
@@ -62,7 +62,7 @@ Catalog mode serves a landing-page prefix at `/` and mounts explicitly
 allowlisted site prefixes under `/sites/<slug>/`:
 
 ```bash
-uvx gcs-static-site-proxy@0.1.0 \
+uvx gcs-static-site-proxy@0.2.0 \
   --bucket private-site-bucket \
   --catalog-prefix team/publication/static-sites
 ```
@@ -117,13 +117,29 @@ Example:
 ```json
 {
   "version": 1,
-  "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "browserCache": "revalidate"
 }
 ```
 
 If it is absent, a strict built-in policy is used. An invalid or inaccessible
 configuration fails startup. The active source, generation and SHA-256 are
 printed.
+
+`browserCache` is optional and supports `no-store` (the default) or
+`revalidate`. Revalidation keeps HTML, extensionless objects and
+proxy-controlled responses at `private,no-store`. Eligible non-HTML objects
+with filename extensions use `private,no-cache`; the proxy forwards browser
+`If-None-Match` and `If-Modified-Since` validators to GCS and relays unchanged
+responses as HTTP 304 without downloading their bodies. If a conditional GCS
+response omits its content type or identifies its representation as HTML, the
+proxy retries it unconditionally; HTML is served as `private,no-store`.
+
+Unlike `no-store`, `private,no-cache` permits the browser to retain private
+object bytes in its local cache. It prevents shared-cache reuse and requires a
+successful GCS revalidation before normal browser reuse, so revoked or expired
+credentials are not hidden by a fresh cache entry. Enable it only when local
+browser storage is suitable for the site's publication classification.
 
 Without an explicit CLI mode, each prefix uses its own GCS configuration and
 falls back to the strict built-in policy when that object is absent. The
@@ -137,6 +153,14 @@ In catalog mode these options affect the landing page and every mounted site.
 For a local override of only one site, run that prefix separately in
 single-site mode.
 
+The site's browser-cache setting is also resolved independently for the
+landing page and each catalog mount. A global override is available for local
+testing or deliberately uniform catalogs:
+
+```bash
+--browser-cache revalidate
+```
+
 `--no-csp` disables only CSP. The proxy continues to send `no-referrer`,
 `nosniff`, and frame-denial headers.
 
@@ -146,7 +170,7 @@ Loopback is the safe default. Explicit non-loopback binding enables network
 mode:
 
 ```bash
-uvx gcs-static-site-proxy@0.1.0 \
+uvx gcs-static-site-proxy@0.2.0 \
   --bucket private-site-bucket \
   --prefix team/sites/my-site \
   --bind 0.0.0.0

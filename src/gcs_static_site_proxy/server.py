@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import html
 import ipaddress
 import json
 import secrets
 import socket
+import sys
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aiohttp import ClientResponse, web
 
@@ -173,6 +175,13 @@ class ProxyConfig:
     reauth_command: str = DEFAULT_REAUTH_COMMAND
     gcs_api_root: str = "https://storage.googleapis.com/storage/v1"
     mounts: tuple[SiteMount, ...] = ()
+
+
+ConfigurationResolver = Callable[[AccessTokenManager], Awaitable[ProxyConfig]]
+
+
+class SourceResolutionError(RuntimeError):
+    """Raised when authenticated source configuration cannot be activated."""
 
 
 @dataclass(frozen=True)
@@ -395,8 +404,16 @@ def is_revalidation_candidate(object_name: str) -> bool:
 
 
 class GcsStaticSiteProxy:
-    def __init__(self, config: ProxyConfig) -> None:
+    def __init__(
+        self,
+        config: ProxyConfig,
+        *,
+        configuration_resolver: ConfigurationResolver | None = None,
+    ) -> None:
         self.config = config
+        self._configuration_resolver = configuration_resolver
+        self._configuration_ready = configuration_resolver is None
+        self._configuration_lock = asyncio.Lock()
         self.tokens = AccessTokenManager(retry_seconds=config.auth_retry_seconds)
         self.login = LoginController(
             config.reauth_command, self.tokens.invalidate, self.tokens.token
@@ -453,8 +470,27 @@ class GcsStaticSiteProxy:
                 "bucket": self.config.bucket,
                 "prefix": self.config.prefix,
                 "network_mode": self.guard.network_mode,
+                "source_ready": self._configuration_ready,
             }
         )
+
+    async def resolve_configuration(self) -> None:
+        if self._configuration_ready:
+            return
+        async with self._configuration_lock:
+            if self._configuration_ready:
+                return
+            if self._configuration_resolver is None:
+                raise AssertionError("unresolved proxy has no configuration resolver")
+            resolved = await self._configuration_resolver(self.tokens)
+            self.config = replace(
+                self.config,
+                prefix=resolved.prefix,
+                csp=resolved.csp,
+                browser_cache=resolved.browser_cache,
+                mounts=resolved.mounts,
+            )
+            self._configuration_ready = True
 
     async def unlock(self, request: web.Request) -> web.Response:
         if not self.guard.valid_unlock_token(request.match_info["token"]):
@@ -482,6 +518,21 @@ class GcsStaticSiteProxy:
             if status["login_state"] not in {"failed", "cancelled"}:
                 status["message"] = "Sign-in required. Select Sign in to continue."
             return self._json_response({"authenticated": False, **status})
+        if not self._configuration_ready:
+            try:
+                await self.resolve_configuration()
+            except AuthenticationUnavailable:
+                return self._json_response(
+                    {
+                        "authenticated": False,
+                        **status,
+                        "message": "Sign-in is not yet accepted by GCS.",
+                    }
+                )
+            except SourceResolutionError:
+                # Authentication succeeded. Reload to show the distinct,
+                # fail-closed source-configuration response.
+                pass
         return self._json_response(
             {
                 "authenticated": True,
@@ -504,6 +555,17 @@ class GcsStaticSiteProxy:
     async def serve(self, request: web.Request) -> web.StreamResponse:
         if request.method not in {"GET", "HEAD"}:
             raise web.HTTPMethodNotAllowed(request.method, ["GET", "HEAD"])
+        try:
+            await self.resolve_configuration()
+        except AuthenticationUnavailable:
+            return self.authentication_page(request)
+        except SourceResolutionError as error:
+            print(f"Unable to load GCS source configuration: {error}", file=sys.stderr)
+            return self._text_response(
+                502,
+                "Unable to load GCS source configuration\n",
+                csp=AUTH_PAGE_CSP,
+            )
         path = decode_request_path(request.raw_path)
         if path is None:
             return self._text_response(404, "Not found\n")

@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -296,3 +296,65 @@ def test_complete_catalog_overrides_skip_per_site_configuration(
 def test_tls_certificate_and_key_must_be_paired() -> None:
     with pytest.raises(ValueError, match="supplied together"):
         cli.tls_context(arguments("--tls-cert", "cert.pem"))
+
+
+def test_run_binds_server_before_resolving_authenticated_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_calls: list[object] = []
+    resolution_calls: list[object] = []
+
+    def fake_run_app(application: object, **_kwargs: object) -> None:
+        run_calls.append(application)
+
+    async def deferred_resolution(_tokens: object) -> cli.ProxyConfig:
+        resolution_calls.append(object())
+        raise AssertionError("resolution should not run before the first request")
+
+    def resolver_factory(
+        _arguments: argparse.Namespace, _config: cli.ProxyConfig
+    ) -> Any:
+        return deferred_resolution
+
+    monkeypatch.setattr(cli.web, "run_app", fake_run_app)
+    monkeypatch.setattr(cli, "deferred_configuration_resolver", resolver_factory)
+    cli.run(arguments("--no-browser"))
+    assert len(run_calls) == 1
+    assert resolution_calls == []
+
+
+def test_deferred_resolver_uses_supplied_token_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = object()
+    calls: list[tuple[argparse.Namespace, object]] = []
+    parsed = arguments()
+    config = cli.ProxyConfig(
+        bucket=parsed.bucket,
+        prefix=parsed.prefix,
+        csp=cli.default_csp(),
+    )
+
+    async def resolve(
+        received_arguments: argparse.Namespace, tokens: object
+    ) -> cli.ResolvedSource:
+        calls.append((received_arguments, tokens))
+        return cli.ResolvedSource(
+            prefix="resolved/site",
+            csp=cli.default_csp(),
+            browser_cache=BrowserCachePolicy(
+                BrowserCacheMode.REVALIDATE, source="test"
+            ),
+        )
+
+    monkeypatch.setattr(cli, "resolve_source_async", resolve)
+    resolver = cli.deferred_configuration_resolver(parsed, config)
+    assert calls == []
+
+    async def invoke() -> cli.ProxyConfig:
+        return await resolver(cast(Any, supplied))
+
+    resolved = asyncio.run(invoke())
+    assert calls == [(parsed, supplied)]
+    assert resolved.prefix == "resolved/site"
+    assert resolved.browser_cache.mode is BrowserCacheMode.REVALIDATE

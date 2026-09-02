@@ -12,6 +12,7 @@ from google.auth.credentials import Credentials
 
 from gcs_static_site_proxy.auth import (
     AccessTokenManager,
+    AuthenticationUnavailable,
     LoginController,
     executable_command,
     split_command,
@@ -43,6 +44,29 @@ def test_access_token_freshness_rejects_missing_and_near_expiry() -> None:
     assert not AccessTokenManager._is_fresh(credentials(None, None))
     near = credentials("token", datetime.now(UTC) + timedelta(minutes=2))
     assert not AccessTokenManager._is_fresh(near)
+
+
+@pytest.mark.asyncio
+async def test_rejected_token_throttles_retry_until_explicit_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = AccessTokenManager(retry_seconds=60)
+    loads = 0
+
+    def load() -> str:
+        nonlocal loads
+        loads += 1
+        return "fresh-token"
+
+    monkeypatch.setattr(manager, "_load_or_refresh", load)
+    await manager.reject("upstream rejected token")
+    with pytest.raises(AuthenticationUnavailable, match="rejected"):
+        await manager.token(report_failure=False)
+    assert loads == 0
+
+    await manager.invalidate()
+    assert await manager.token() == "fresh-token"
+    assert loads == 1
 
 
 def test_split_command_preserves_windows_paths() -> None:

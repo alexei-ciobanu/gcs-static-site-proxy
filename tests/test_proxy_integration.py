@@ -3,15 +3,22 @@ from __future__ import annotations
 import gzip
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any, cast
 from urllib.parse import unquote
 
 import pytest
-from aiohttp import ClientSession, CookieJar, web
+from aiohttp import ClientPayloadError, ClientSession, CookieJar, web
 from aiohttp.test_utils import TestServer
 
-from gcs_static_site_proxy.gcs import GcsClient
-from gcs_static_site_proxy.server import GcsStaticSiteProxy, ProxyConfig, SiteMount
+from gcs_static_site_proxy.auth import AuthenticationUnavailable
+from gcs_static_site_proxy.gcs import GcsClient, GcsConnectionError
+from gcs_static_site_proxy.server import (
+    GcsStaticSiteProxy,
+    ProxyConfig,
+    SiteMount,
+    SourceResolutionError,
+)
 from gcs_static_site_proxy.site_config import (
     BrowserCacheMode,
     BrowserCachePolicy,
@@ -24,6 +31,7 @@ class FakeTokens:
     def __init__(self) -> None:
         self.force_reloads = 0
         self.invalidations = 0
+        self.rejections = 0
 
     async def token(self, *, force_reload: bool = False, **_kwargs: Any) -> str:
         self.force_reloads += int(force_reload)
@@ -31,6 +39,9 @@ class FakeTokens:
 
     async def invalidate(self) -> None:
         self.invalidations += 1
+
+    async def reject(self, _message: str) -> None:
+        self.rejections += 1
 
 
 @asynccontextmanager
@@ -147,6 +158,198 @@ def site_objects() -> dict[str, tuple[bytes, dict[str, str]]]:
             },
         ),
     }
+
+
+@pytest.mark.asyncio
+async def test_proxy_starts_unresolved_and_recovers_without_restart() -> None:
+    ready = False
+    attempts = 0
+    async with mock_gcs(site_objects()) as api_root:
+        config = ProxyConfig(
+            bucket="example-bucket",
+            prefix="team/site",
+            csp=default_csp(),
+            gcs_api_root=api_root,
+        )
+
+        async def resolve(_tokens: object) -> ProxyConfig:
+            nonlocal attempts
+            attempts += 1
+            if not ready:
+                raise AuthenticationUnavailable("test credentials unavailable")
+            return replace(
+                config,
+                browser_cache=BrowserCachePolicy(
+                    BrowserCacheMode.REVALIDATE,
+                    source="resolved test configuration",
+                ),
+            )
+
+        proxy = GcsStaticSiteProxy(config, configuration_resolver=resolve)
+        proxy.tokens = cast(Any, FakeTokens())
+        server = TestServer(proxy.application())
+        await server.start_server()
+        async with ClientSession() as session:
+            base = str(server.make_url("/"))
+            unavailable = await session.get(base)
+            assert unavailable.status == 503
+            assert "Google Cloud sign-in required" in await unavailable.text()
+            health = await session.get(f"{base}__gcs_proxy/health")
+            assert (await health.json())["source_ready"] is False
+
+            ready = True
+            status = await session.get(f"{base}__gcs_proxy/auth/status")
+            assert (await status.json())["authenticated"] is True
+            recovered = await session.get(base)
+            assert recovered.status == 200
+            assert "Private site" in await recovered.text()
+            health = await session.get(f"{base}__gcs_proxy/health")
+            assert (await health.json())["source_ready"] is True
+        await server.close()
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_deferred_catalog_configuration_activates_exact_mounts() -> None:
+    objects = {
+        "catalog/index.html": (
+            b'<a href="/sites/demo/">Demo</a>',
+            {"Content-Type": "text/html; charset=utf-8"},
+        ),
+        "projects/demo/publication/site/index.html": (
+            b"<h1>Mounted demo</h1>",
+            {"Content-Type": "text/html; charset=utf-8"},
+        ),
+    }
+    async with mock_gcs(objects) as api_root:
+        config = ProxyConfig(
+            bucket="example-bucket",
+            prefix="catalog",
+            csp=default_csp(),
+            gcs_api_root=api_root,
+        )
+
+        async def resolve(_tokens: object) -> ProxyConfig:
+            return replace(
+                config,
+                mounts=(
+                    SiteMount(
+                        slug="demo",
+                        title="Demo",
+                        prefix="projects/demo/publication/site",
+                        csp=default_csp(),
+                    ),
+                ),
+            )
+
+        proxy = GcsStaticSiteProxy(config, configuration_resolver=resolve)
+        proxy.tokens = cast(Any, FakeTokens())
+        server = TestServer(proxy.application())
+        await server.start_server()
+        async with ClientSession() as session:
+            base = str(server.make_url("/"))
+            landing = await session.get(base)
+            assert landing.status == 200
+            mounted = await session.get(f"{base}sites/demo/")
+            assert mounted.status == 200
+            assert await mounted.text() == "<h1>Mounted demo</h1>"
+            unknown = await session.get(f"{base}sites/unknown/")
+            assert unknown.status == 404
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_source_configuration_failure_is_not_reported_as_authentication() -> None:
+    config = ProxyConfig(
+        bucket="example-bucket",
+        prefix="catalog",
+        csp=default_csp(),
+    )
+
+    async def resolve(_tokens: object) -> ProxyConfig:
+        raise SourceResolutionError("catalog is invalid")
+
+    proxy = GcsStaticSiteProxy(config, configuration_resolver=resolve)
+    server = TestServer(proxy.application())
+    await server.start_server()
+    async with ClientSession() as session:
+        response = await session.get(str(server.make_url("/")))
+        assert response.status == 502
+        body = await response.text()
+        assert body == "Unable to load GCS source configuration\n"
+        assert "sign-in" not in body.lower()
+    await server.close()
+
+
+@pytest.mark.parametrize("prefix", ["team/site", "catalog"])
+@pytest.mark.asyncio
+async def test_config_unauthorized_serves_authentication_page(prefix: str) -> None:
+    config_name = f"{prefix}/configuration.json"
+    objects = {
+        config_name: (
+            b"{}",
+            {"Content-Type": "application/json", "X-Test-Status": "401"},
+        )
+    }
+    async with mock_gcs(objects) as api_root:
+        config = ProxyConfig(
+            bucket="example-bucket",
+            prefix=prefix,
+            csp=default_csp(),
+            gcs_api_root=api_root,
+        )
+
+        async def resolve(tokens: object) -> ProxyConfig:
+            async with GcsClient(
+                "example-bucket", cast(Any, tokens), api_root=api_root
+            ) as client:
+                await client.read_config_object(config_name, maximum_bytes=100)
+            raise AssertionError("persistent 401 should prevent source resolution")
+
+        proxy = GcsStaticSiteProxy(config, configuration_resolver=resolve)
+        proxy.tokens = cast(Any, FakeTokens())
+        server = TestServer(proxy.application())
+        await server.start_server()
+        async with ClientSession() as session:
+            response = await session.get(str(server.make_url("/")))
+            assert response.status == 503
+            assert "Google Cloud sign-in required" in await response.text()
+            status = await session.get(str(server.make_url("/__gcs_proxy/auth/status")))
+            assert (await status.json())["authenticated"] is False
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_network_proxy_retains_operator_access_controls() -> None:
+    config = ProxyConfig(
+        bucket="example-bucket",
+        prefix="team/site",
+        csp=default_csp(),
+        bind="0.0.0.0",
+    )
+
+    async def resolve(_tokens: object) -> ProxyConfig:
+        raise AuthenticationUnavailable("test credentials unavailable")
+
+    proxy = GcsStaticSiteProxy(config, configuration_resolver=resolve)
+    server = TestServer(proxy.application())
+    await server.start_server()
+    async with ClientSession(cookie_jar=CookieJar(unsafe=True)) as session:
+        base = str(server.make_url("/"))
+        locked = await session.get(base)
+        assert locked.status == 401
+        assert "Access token required" in await locked.text()
+
+        token = proxy.guard.session_token
+        assert token
+        unlocked = await session.get(
+            f"{base}__gcs_proxy/unlock/{token}", allow_redirects=False
+        )
+        assert unlocked.status == 303
+        unavailable = await session.get(base)
+        assert unavailable.status == 503
+        assert "Google Cloud sign-in required" in await unavailable.text()
+    await server.close()
 
 
 @pytest.mark.asyncio
@@ -434,3 +637,61 @@ async def test_gcs_client_refreshes_once_after_unauthorized_response() -> None:
         assert tokens.force_reloads == 1
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_config_unauthorized_is_an_authentication_failure() -> None:
+    requests = 0
+
+    async def media(_request: web.Request) -> web.Response:
+        nonlocal requests
+        requests += 1
+        return web.Response(status=401)
+
+    app = web.Application()
+    app.router.add_get("/storage/v1/b/{bucket}/o/{name:.*}", media)
+    server = TestServer(app)
+    await server.start_server()
+    tokens = FakeTokens()
+    try:
+        async with GcsClient(
+            "example-bucket",
+            cast(Any, tokens),
+            api_root=str(server.make_url("/storage/v1")),
+        ) as client:
+            with pytest.raises(AuthenticationUnavailable, match="rejected"):
+                await client.read_config_object("site/config.json", maximum_bytes=10)
+        assert requests == 2
+        assert tokens.invalidations == 1
+        assert tokens.rejections == 1
+        assert tokens.force_reloads == 1
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_config_payload_failure_is_a_gcs_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenContent:
+        async def read(self, _maximum_bytes: int) -> bytes:
+            raise ClientPayloadError("truncated response")
+
+    class BrokenResponse:
+        status = 200
+        content = BrokenContent()
+
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def release(self) -> None:
+            pass
+
+    client = GcsClient("example-bucket", cast(Any, FakeTokens()))
+
+    async def request(_object_name: str) -> BrokenResponse:
+        return BrokenResponse()
+
+    monkeypatch.setattr(client, "request", request)
+    with pytest.raises(GcsConnectionError, match="failed reading"):
+        await client.read_config_object("site/config.json", maximum_bytes=10)

@@ -8,11 +8,11 @@ from typing import Any, cast
 from urllib.parse import unquote
 
 import pytest
-from aiohttp import ClientSession, CookieJar, web
+from aiohttp import ClientPayloadError, ClientSession, CookieJar, web
 from aiohttp.test_utils import TestServer
 
 from gcs_static_site_proxy.auth import AuthenticationUnavailable
-from gcs_static_site_proxy.gcs import GcsClient
+from gcs_static_site_proxy.gcs import GcsClient, GcsConnectionError
 from gcs_static_site_proxy.server import (
     GcsStaticSiteProxy,
     ProxyConfig,
@@ -31,6 +31,7 @@ class FakeTokens:
     def __init__(self) -> None:
         self.force_reloads = 0
         self.invalidations = 0
+        self.rejections = 0
 
     async def token(self, *, force_reload: bool = False, **_kwargs: Any) -> str:
         self.force_reloads += int(force_reload)
@@ -38,6 +39,9 @@ class FakeTokens:
 
     async def invalidate(self) -> None:
         self.invalidations += 1
+
+    async def reject(self, _message: str) -> None:
+        self.rejections += 1
 
 
 @asynccontextmanager
@@ -194,6 +198,8 @@ async def test_proxy_starts_unresolved_and_recovers_without_restart() -> None:
             assert (await health.json())["source_ready"] is False
 
             ready = True
+            status = await session.get(f"{base}__gcs_proxy/auth/status")
+            assert (await status.json())["authenticated"] is True
             recovered = await session.get(base)
             assert recovered.status == 200
             assert "Private site" in await recovered.text()
@@ -308,6 +314,8 @@ async def test_config_unauthorized_serves_authentication_page(prefix: str) -> No
             response = await session.get(str(server.make_url("/")))
             assert response.status == 503
             assert "Google Cloud sign-in required" in await response.text()
+            status = await session.get(str(server.make_url("/__gcs_proxy/auth/status")))
+            assert (await status.json())["authenticated"] is False
         await server.close()
 
 
@@ -654,7 +662,36 @@ async def test_persistent_config_unauthorized_is_an_authentication_failure() -> 
             with pytest.raises(AuthenticationUnavailable, match="rejected"):
                 await client.read_config_object("site/config.json", maximum_bytes=10)
         assert requests == 2
-        assert tokens.invalidations == 2
+        assert tokens.invalidations == 1
+        assert tokens.rejections == 1
         assert tokens.force_reloads == 1
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_config_payload_failure_is_a_gcs_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenContent:
+        async def read(self, _maximum_bytes: int) -> bytes:
+            raise ClientPayloadError("truncated response")
+
+    class BrokenResponse:
+        status = 200
+        content = BrokenContent()
+
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def release(self) -> None:
+            pass
+
+    client = GcsClient("example-bucket", cast(Any, FakeTokens()))
+
+    async def request(_object_name: str) -> BrokenResponse:
+        return BrokenResponse()
+
+    monkeypatch.setattr(client, "request", request)
+    with pytest.raises(GcsConnectionError, match="failed reading"):
+        await client.read_config_object("site/config.json", maximum_bytes=10)

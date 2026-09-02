@@ -350,7 +350,11 @@ def test_deferred_resolver_uses_supplied_token_manager(
     monkeypatch.setattr(cli, "resolve_source_async", resolve)
     resolver = cli.deferred_configuration_resolver(parsed, config)
     assert calls == []
-    resolved = asyncio.run(resolver(cast(Any, supplied)))
+
+    async def invoke() -> cli.ProxyConfig:
+        return await resolver(cast(Any, supplied))
+
+    resolved = asyncio.run(invoke())
     assert calls == [(parsed, supplied)]
     assert resolved.prefix == "resolved/site"
     assert resolved.browser_cache.mode is BrowserCacheMode.REVALIDATE

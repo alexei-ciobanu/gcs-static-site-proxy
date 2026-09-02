@@ -102,6 +102,13 @@ class AccessTokenManager:
             self._clear()
             self._failed_at = 0.0
 
+    async def reject(self, message: str) -> None:
+        """Discard a rejected token and throttle automatic retries."""
+        async with self._lock:
+            self._clear()
+            self._failed_at = time.monotonic()
+            self._last_error = message
+
     def _load_or_refresh(self) -> str:
         if self._credentials is None:
             self._credentials, _ = google.auth.default(scopes=SCOPES)

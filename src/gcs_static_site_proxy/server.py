@@ -518,6 +518,21 @@ class GcsStaticSiteProxy:
             if status["login_state"] not in {"failed", "cancelled"}:
                 status["message"] = "Sign-in required. Select Sign in to continue."
             return self._json_response({"authenticated": False, **status})
+        if not self._configuration_ready:
+            try:
+                await self.resolve_configuration()
+            except AuthenticationUnavailable:
+                return self._json_response(
+                    {
+                        "authenticated": False,
+                        **status,
+                        "message": "Sign-in is not yet accepted by GCS.",
+                    }
+                )
+            except SourceResolutionError:
+                # Authentication succeeded. Reload to show the distinct,
+                # fail-closed source-configuration response.
+                pass
         return self._json_response(
             {
                 "authenticated": True,

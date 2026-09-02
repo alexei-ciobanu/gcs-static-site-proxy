@@ -99,7 +99,9 @@ class GcsClient:
             if response.status != 401:
                 return response
             if attempt == 1:
-                await self.tokens.invalidate()
+                await self.tokens.reject(
+                    f"GCS rejected authentication for gs://{self.bucket}/{object_name}"
+                )
                 return response
             response.release()
             await self.tokens.invalidate()
@@ -123,7 +125,13 @@ class GcsClient:
                     f"GCS returned HTTP {response.status} for gs://"
                     f"{self.bucket}/{object_name}"
                 )
-            body = await response.content.read(maximum_bytes + 1)
+            try:
+                body = await response.content.read(maximum_bytes + 1)
+            except (ClientError, TimeoutError) as error:
+                raise GcsConnectionError(
+                    f"failed reading GCS configuration gs://"
+                    f"{self.bucket}/{object_name}: {error}"
+                ) from error
             if len(body) > maximum_bytes:
                 raise GcsConnectionError(
                     f"GCS object exceeds the {maximum_bytes}-byte limit"

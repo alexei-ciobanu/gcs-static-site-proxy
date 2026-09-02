@@ -129,9 +129,10 @@ Example:
 }
 ```
 
-If it is absent, a strict built-in policy is used. An invalid, inaccessible or
-unreachable configuration produces a fail-closed HTTP 502 response and is
-reported in the proxy log; later requests can retry resolution. The active
+If it is absent, a strict built-in policy is used. Missing or rejected
+authentication produces the HTTP 503 sign-in page. An invalid, forbidden or
+unreachable configuration instead produces a fail-closed HTTP 502 response and
+is reported in the proxy log; later requests can retry resolution. The active
 source, generation and SHA-256 are printed after resolution succeeds.
 
 `browserCache` is optional and supports `no-store` (the default) or

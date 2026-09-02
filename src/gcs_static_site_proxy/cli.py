@@ -13,7 +13,7 @@ import ssl
 import sys
 import webbrowser
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import truststore
@@ -34,9 +34,11 @@ from gcs_static_site_proxy.catalog import (
 )
 from gcs_static_site_proxy.gcs import GcsClient, GcsConnectionError
 from gcs_static_site_proxy.server import (
+    ConfigurationResolver,
     GcsStaticSiteProxy,
     ProxyConfig,
     SiteMount,
+    SourceResolutionError,
 )
 from gcs_static_site_proxy.site_config import (
     MAX_SITE_CONFIG_BYTES,
@@ -203,10 +205,14 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def gcs_site_configuration(
-    *, bucket: str, prefix: str, auth_retry_seconds: int
+    *,
+    bucket: str,
+    prefix: str,
+    auth_retry_seconds: int,
+    tokens: AccessTokenManager | None = None,
 ) -> SiteConfiguration | None:
-    tokens = AccessTokenManager(retry_seconds=auth_retry_seconds)
-    async with GcsClient(bucket, tokens) as gcs:
+    token_manager = tokens or AccessTokenManager(retry_seconds=auth_retry_seconds)
+    async with GcsClient(bucket, token_manager) as gcs:
         return await read_site_configuration(gcs, bucket=bucket, prefix=prefix)
 
 
@@ -251,12 +257,16 @@ def explicit_browser_cache(
     )
 
 
-async def gcs_catalog_source(arguments: argparse.Namespace) -> ResolvedSource:
+async def gcs_catalog_source(
+    arguments: argparse.Namespace, tokens: AccessTokenManager | None = None
+) -> ResolvedSource:
     catalog_prefix = arguments.catalog_prefix
     assert isinstance(catalog_prefix, str)
-    tokens = AccessTokenManager(retry_seconds=arguments.auth_retry_seconds)
+    token_manager = tokens or AccessTokenManager(
+        retry_seconds=arguments.auth_retry_seconds
+    )
     catalog_object = f"{catalog_prefix}/{CATALOG_CONFIG_NAME}"
-    async with GcsClient(arguments.bucket, tokens) as gcs:
+    async with GcsClient(arguments.bucket, token_manager) as gcs:
         result = await gcs.read_config_object(
             catalog_object, maximum_bytes=MAX_CATALOG_CONFIG_BYTES
         )
@@ -312,21 +322,22 @@ async def gcs_catalog_source(arguments: argparse.Namespace) -> ResolvedSource:
     )
 
 
-def resolve_source(arguments: argparse.Namespace) -> ResolvedSource:
+async def resolve_source_async(
+    arguments: argparse.Namespace, tokens: AccessTokenManager | None = None
+) -> ResolvedSource:
     if arguments.catalog_prefix:
-        return asyncio.run(gcs_catalog_source(arguments))
+        return await gcs_catalog_source(arguments, tokens)
     assert isinstance(arguments.prefix, str)
     override = explicit_csp(arguments)
     cache_override = explicit_browser_cache(arguments)
     configured = (
         None
         if override is not None and cache_override is not None
-        else asyncio.run(
-            gcs_site_configuration(
-                bucket=arguments.bucket,
-                prefix=arguments.prefix,
-                auth_retry_seconds=arguments.auth_retry_seconds,
-            )
+        else await gcs_site_configuration(
+            bucket=arguments.bucket,
+            prefix=arguments.prefix,
+            auth_retry_seconds=arguments.auth_retry_seconds,
+            tokens=tokens,
         )
     )
     return ResolvedSource(
@@ -337,6 +348,10 @@ def resolve_source(arguments: argparse.Namespace) -> ResolvedSource:
             or (configured.browser_cache if configured else default_browser_cache())
         ),
     )
+
+
+def resolve_source(arguments: argparse.Namespace) -> ResolvedSource:
+    return asyncio.run(resolve_source_async(arguments))
 
 
 def tls_context(arguments: argparse.Namespace) -> ssl.SSLContext | None:
@@ -396,23 +411,55 @@ async def open_browser(url: str) -> None:
         print(f"Could not open the default browser. Open {url} manually.")
 
 
+def deferred_configuration_resolver(
+    arguments: argparse.Namespace, config: ProxyConfig
+) -> ConfigurationResolver:
+    async def configuration_resolver(tokens: AccessTokenManager) -> ProxyConfig:
+        try:
+            source = await resolve_source_async(arguments, tokens)
+        except AuthenticationUnavailable:
+            raise
+        except (
+            CatalogError,
+            GcsConnectionError,
+            SiteConfigError,
+            ValueError,
+        ) as error:
+            raise SourceResolutionError(str(error)) from error
+        resolved = replace(
+            config,
+            prefix=source.prefix,
+            csp=source.csp,
+            browser_cache=source.browser_cache,
+            mounts=source.mounts,
+        )
+        print_resolved_source(arguments, source, resolved.bucket)
+        return resolved
+
+    return configuration_resolver
+
+
 def run(arguments: argparse.Namespace) -> None:
-    source = resolve_source(arguments)
     ssl_context = tls_context(arguments)
+    prefix = arguments.catalog_prefix or arguments.prefix
+    assert isinstance(prefix, str)
     config = ProxyConfig(
         bucket=arguments.bucket,
-        prefix=source.prefix,
-        csp=source.csp,
-        browser_cache=source.browser_cache,
+        prefix=prefix,
+        csp=explicit_csp(arguments) or default_csp(),
+        browser_cache=explicit_browser_cache(arguments) or default_browser_cache(),
         bind=arguments.bind,
         port=arguments.port,
         allow_hosts=tuple(arguments.allow_host),
         tls_enabled=ssl_context is not None,
         auth_retry_seconds=arguments.auth_retry_seconds,
         reauth_command=arguments.reauth_command,
-        mounts=source.mounts,
     )
-    proxy = GcsStaticSiteProxy(config)
+
+    proxy = GcsStaticSiteProxy(
+        config,
+        configuration_resolver=deferred_configuration_resolver(arguments, config),
+    )
     application = proxy.application()
     scheme = "https" if ssl_context else "http"
     unlock = (
@@ -437,26 +484,7 @@ def run(arguments: argparse.Namespace) -> None:
 
     print(f"GCS source: gs://{config.bucket}/{config.prefix}/")
     print("Authentication: direct user ADC")
-    if source.catalog is not None:
-        print(f"Catalog source: {source.catalog.source}")
-        if source.catalog.generation:
-            print(f"Catalog object generation: {source.catalog.generation}")
-        print(f"Catalog SHA-256: {source.catalog.sha256}")
-        if arguments.no_csp or arguments.csp_override_file or arguments.strict_csp:
-            print(
-                "WARNING: the explicit CSP mode applies to the landing page and "
-                "every mounted site.",
-                file=sys.stderr,
-            )
-    print_policy("Landing" if source.catalog else "Site", source.csp)
-    print_browser_cache("Landing" if source.catalog else "Site", source.browser_cache)
-    for mount in source.mounts:
-        print(
-            f"Mount /sites/{mount.slug}/ -> "
-            f"gs://{config.bucket}/{mount.prefix}/ ({mount.title})"
-        )
-        print_policy(f"Mount /sites/{mount.slug}/", mount.csp)
-        print_browser_cache(f"Mount /sites/{mount.slug}/", mount.browser_cache)
+    print("Source configuration: resolves on the first site request.")
     print(f"Local URL: {local_url}")
     if proxy.guard.network_mode:
         print(
@@ -475,6 +503,32 @@ def run(arguments: argparse.Namespace) -> None:
         print=None,
         access_log=None,
     )
+
+
+def print_resolved_source(
+    arguments: argparse.Namespace, source: ResolvedSource, bucket: str
+) -> None:
+    print("Source configuration loaded.")
+    if source.catalog is not None:
+        print(f"Catalog source: {source.catalog.source}")
+        if source.catalog.generation:
+            print(f"Catalog object generation: {source.catalog.generation}")
+        print(f"Catalog SHA-256: {source.catalog.sha256}")
+        if arguments.no_csp or arguments.csp_override_file or arguments.strict_csp:
+            print(
+                "WARNING: the explicit CSP mode applies to the landing page and "
+                "every mounted site.",
+                file=sys.stderr,
+            )
+    print_policy("Landing" if source.catalog else "Site", source.csp)
+    print_browser_cache("Landing" if source.catalog else "Site", source.browser_cache)
+    for mount in source.mounts:
+        print(
+            f"Mount /sites/{mount.slug}/ -> "
+            f"gs://{bucket}/{mount.prefix}/ ({mount.title})"
+        )
+        print_policy(f"Mount /sites/{mount.slug}/", mount.csp)
+        print_browser_cache(f"Mount /sites/{mount.slug}/", mount.browser_cache)
 
 
 def print_policy(label: str, csp: ContentSecurityPolicy) -> None:

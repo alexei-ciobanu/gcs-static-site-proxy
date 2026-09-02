@@ -22,6 +22,10 @@ Initialize ADC:
 gcloud auth login --update-adc
 ```
 
+The proxy can also start without usable ADC. Its local URL serves a built-in
+sign-in page and activates the configured GCS source after authentication
+succeeds; no process restart is required.
+
 ## Install and run on localhost
 
 Run the published package in an isolated environment:
@@ -94,10 +98,12 @@ configuration objects are browser-accessible. Catalog editors can expose any
 prefix that their proxy operator can read, so treat the catalog as a browser
 publication allowlist and never mount a protected artifact prefix.
 
-The proxy loads and validates the catalog and every site's CSP at startup. The
-landing page uses the catalog prefix's `.gcs-static-site-proxy.json`; each
-mounted site uses the same well-known filename under its own prefix. Explicit
-CLI CSP overrides apply to all mounts.
+The proxy loads and validates the catalog and every site's CSP on the first
+site request. The landing page uses the catalog prefix's
+`.gcs-static-site-proxy.json`; each mounted site uses the same well-known
+filename under its own prefix. Explicit CLI CSP overrides apply to all mounts.
+Until source resolution succeeds, catalog routes remain inactive and no GCS
+site content is served.
 
 Path-mounted sites share a browser origin. Per-response CSPs remain distinct,
 but a script running in one mounted site can make same-origin requests to other
@@ -106,7 +112,8 @@ use separate origins when stronger isolation is required.
 
 ## Site security configuration
 
-Unless overridden, the proxy requests this exact object at startup:
+Unless overridden, the proxy requests this exact object when resolving the
+site source:
 
 ```text
 <prefix>/.gcs-static-site-proxy.json
@@ -122,9 +129,10 @@ Example:
 }
 ```
 
-If it is absent, a strict built-in policy is used. An invalid or inaccessible
-configuration fails startup. The active source, generation and SHA-256 are
-printed.
+If it is absent, a strict built-in policy is used. An invalid, inaccessible or
+unreachable configuration produces a fail-closed HTTP 502 response and is
+reported in the proxy log; later requests can retry resolution. The active
+source, generation and SHA-256 are printed after resolution succeeds.
 
 `browserCache` is optional and supports `no-store` (the default) or
 `revalidate`. Revalidation keeps HTML, extensionless objects and

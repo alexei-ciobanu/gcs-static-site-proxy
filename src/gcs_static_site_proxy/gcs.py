@@ -114,6 +114,10 @@ class GcsClient:
         try:
             if response.status == 404:
                 return None
+            if response.status == 401:
+                raise AuthenticationUnavailable(
+                    f"GCS rejected authentication for gs://{self.bucket}/{object_name}"
+                )
             if response.status != 200:
                 raise GcsConnectionError(
                     f"GCS returned HTTP {response.status} for gs://"

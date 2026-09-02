@@ -31,7 +31,7 @@ succeeds; no process restart is required.
 Run the published package in an isolated environment:
 
 ```bash
-uvx gcs-static-site-proxy@0.2.0 \
+uvx gcs-static-site-proxy@0.3.0 \
   --bucket private-site-bucket \
   --prefix team/sites/my-site
 ```
@@ -40,7 +40,7 @@ Alternatively, install it with `pip` and use either the command or Python
 module entry point:
 
 ```bash
-python -m pip install gcs-static-site-proxy==0.2.0
+python -m pip install gcs-static-site-proxy==0.3.0
 python -m gcs_static_site_proxy \
   --bucket private-site-bucket \
   --prefix team/sites/my-site
@@ -66,7 +66,7 @@ Catalog mode serves a landing-page prefix at `/` and mounts explicitly
 allowlisted site prefixes under `/sites/<slug>/`:
 
 ```bash
-uvx gcs-static-site-proxy@0.2.0 \
+uvx gcs-static-site-proxy@0.3.0 \
   --bucket private-site-bucket \
   --catalog-prefix team/publication/static-sites
 ```
@@ -179,7 +179,7 @@ Loopback is the safe default. Explicit non-loopback binding enables network
 mode:
 
 ```bash
-uvx gcs-static-site-proxy@0.2.0 \
+uvx gcs-static-site-proxy@0.3.0 \
   --bucket private-site-bucket \
   --prefix team/sites/my-site \
   --bind 0.0.0.0
